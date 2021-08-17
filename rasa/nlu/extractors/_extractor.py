@@ -1,4 +1,9 @@
-import abc
+# flake8: noqa
+# WARNING: This module will be dropped before Rasa Open Source 3.0 is released.
+#          Please don't do any changes in this module and rather adapt
+#          EntityExtractorGraphComponent from the regular
+#          `rasa.nlu.extractors.extractor` module. This module is a workaround to defer
+#          breaking changes due to the architecture revamp in 3.0.
 from typing import Any, Dict, List, Text, Tuple, Optional, NamedTuple
 
 import rasa.shared.utils.io
@@ -6,7 +11,7 @@ from rasa.shared.constants import DOCS_URL_TRAINING_DATA_NLU
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.nlu.training_data.message import Message
 from rasa.nlu.tokenizers.tokenizer import Token
-from rasa.nlu.components import NLUGraphComponent
+from rasa.nlu.components import Component
 from rasa.nlu.constants import (
     TOKENS_NAMES,
     ENTITY_ATTRIBUTE_CONFIDENCE_TYPE,
@@ -31,11 +36,6 @@ from rasa.shared.nlu.constants import (
 )
 import rasa.utils.train_utils
 
-from rasa.nlu.extractors._extractor import EntityExtractor
-
-# This is a workaround around until we have all components migrated to `GraphComponent`.
-EntityExtractor = EntityExtractor
-
 
 class EntityTagSpec(NamedTuple):
     """Specification of an entity tag present in the training data."""
@@ -46,7 +46,7 @@ class EntityTagSpec(NamedTuple):
     num_tags: int
 
 
-class EntityExtractorGraphComponent(NLUGraphComponent, abc.ABC):
+class EntityExtractor(Component):
     """Entity extractors are components which extract entities.
 
     They can be placed in the pipeline like other components, and can extract
@@ -92,9 +92,14 @@ class EntityExtractorGraphComponent(NLUGraphComponent, abc.ABC):
             default behaviour for splitting any entity types for which no
             behaviour is defined.
         """
+        split_entities_config = self.component_config.get(
+            SPLIT_ENTITIES_BY_COMMA, SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE
+        )
+        default_value = self.defaults.get(
+            SPLIT_ENTITIES_BY_COMMA, SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE
+        )
         return rasa.utils.train_utils.init_split_entities(
-            self.component_config[SPLIT_ENTITIES_BY_COMMA],
-            SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
+            split_entities_config, default_value
         )
 
     @staticmethod

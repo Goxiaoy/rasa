@@ -1,4 +1,9 @@
-from __future__ import annotations
+# flake8: noqa
+# WARNING: This module will be dropped before Rasa Open Source 3.0 is released.
+#          Please don't do any changes in this module and rather adapt DIETClassifier2
+#          from the regular `rasa.nlu.classifiers.diet_classifier` module.
+#          This module is a workaround to defer breaking changes due to the architecture
+#          revamp in 3.0.
 import copy
 import logging
 from collections import defaultdict
@@ -11,20 +16,14 @@ import tensorflow as tf
 
 from typing import Any, Dict, List, Optional, Text, Tuple, Union, Type
 
-from rasa.engine.graph import ExecutionContext
-from rasa.engine.storage.resource import Resource
-from rasa.engine.storage.storage import ModelStorage
 import rasa.shared.utils.io
 import rasa.utils.io as io_utils
 import rasa.nlu.utils.bilou_utils as bilou_utils
 from rasa.shared.constants import DIAGNOSTIC_DATA
-from rasa.nlu.classifiers.classifier import (
-    IntentClassifierGraphComponent,
-)
-from rasa.nlu.extractors.extractor import (
-    EntityExtractorGraphComponent,
-    EntityTagSpec,
-)
+from rasa.nlu.featurizers.featurizer import Featurizer
+from rasa.nlu.components import Component
+from rasa.nlu.classifiers.classifier import IntentClassifier
+from rasa.nlu.extractors.extractor import EntityExtractor, EntityTagSpec
 from rasa.nlu.classifiers import LABEL_RANKING_LENGTH
 from rasa.utils import train_utils
 from rasa.utils.tensorflow import rasa_layers
@@ -50,6 +49,7 @@ from rasa.nlu.config import RasaNLUModelConfig
 from rasa.shared.exceptions import InvalidConfigException
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.nlu.training_data.message import Message
+from rasa.nlu.model import Metadata
 from rasa.utils.tensorflow.constants import (
     LABEL,
     IDS,
@@ -107,11 +107,6 @@ from rasa.utils.tensorflow.constants import (
     SOFTMAX,
 )
 
-from rasa.nlu.classifiers._diet_classifier import DIETClassifier
-
-# This is a workaround around until we have all components migrated to `GraphComponent`.
-DIETClassifier = DIETClassifier
-
 logger = logging.getLogger(__name__)
 
 SPARSE = "sparse"
@@ -122,9 +117,7 @@ LABEL_SUB_KEY = IDS
 POSSIBLE_TAGS = [ENTITY_ATTRIBUTE_TYPE, ENTITY_ATTRIBUTE_ROLE, ENTITY_ATTRIBUTE_GROUP]
 
 
-class DIETClassifierGraphComponent(
-    IntentClassifierGraphComponent, EntityExtractorGraphComponent
-):
+class DIETClassifier(IntentClassifier, EntityExtractor):
     """A multi-task model for intent classification and entity extraction.
 
     DIET is Dual Intent and Entity Transformer.
@@ -137,8 +130,12 @@ class DIETClassifierGraphComponent(
     similarities with negative samples.
     """
 
+    @classmethod
+    def required_components(cls) -> List[Type[Component]]:
+        return [Featurizer]
+
     # please make sure to update the docs when changing a default parameter
-    default_config = {
+    defaults = {
         # ## Architecture of the used neural network
         # Hidden layer sizes for layers before the embedding layers for user message
         # and labels.
@@ -332,28 +329,21 @@ class DIETClassifierGraphComponent(
 
     def __init__(
         self,
-        config: Dict[Text, Any],
-        model_storage: ModelStorage,
-        resource: Resource,
-        execution_context: ExecutionContext,
+        component_config: Optional[Dict[Text, Any]] = None,
         index_label_id_mapping: Optional[Dict[int, Text]] = None,
         entity_tag_specs: Optional[List[EntityTagSpec]] = None,
         model: Optional[RasaModel] = None,
+        finetune_mode: bool = False,
         sparse_feature_sizes: Optional[Dict[Text, Dict[Text, List[int]]]] = None,
     ) -> None:
         """Declare instance variables with default values."""
-        if EPOCHS not in config:
+        if component_config is not None and EPOCHS not in component_config:
             rasa.shared.utils.io.raise_warning(
                 f"Please configure the number of '{EPOCHS}' in your configuration file."
                 f" We will change the default value of '{EPOCHS}' in the future to 1. "
             )
 
-        super().__init__(
-            config=config,
-            model_storage=model_storage,
-            resource=resource,
-            execution_context=execution_context,
-        )
+        super().__init__(component_config)
 
         self._check_config_parameters()
 
@@ -373,7 +363,7 @@ class DIETClassifierGraphComponent(
 
         self.split_entities_config = self.init_split_entities()
 
-        self.finetune_mode = self._execution_context.is_finetuning
+        self.finetune_mode = finetune_mode
         self._sparse_feature_sizes = sparse_feature_sizes
 
         if not self.model and self.finetune_mode:
@@ -840,6 +830,7 @@ class DIETClassifierGraphComponent(
     def train(
         self,
         training_data: TrainingData,
+        config: Optional[RasaNLUModelConfig] = None,
         **kwargs: Any,
     ) -> None:
         """Train the embedding intent classifier on a data set."""
@@ -902,8 +893,6 @@ class DIETClassifierGraphComponent(
             verbose=False,
             shuffle=False,  # we use custom shuffle inside data generator
         )
-
-        self.persist()
 
     # process helpers
     def _predict(
@@ -1001,141 +990,150 @@ class DIETClassifierGraphComponent(
 
         return entities
 
-    def process(self, messages: List[Message], **kwargs: Any) -> List[Message]:
+    def process(self, message: Message, **kwargs: Any) -> None:
         """Augments the message with intents, entities, and diagnostic data."""
+        out = self._predict(message)
 
-        for message in messages:
-            out = self._predict(message)
+        if self.component_config[INTENT_CLASSIFICATION]:
+            label, label_ranking = self._predict_label(out)
 
-            if self.component_config[INTENT_CLASSIFICATION]:
-                label, label_ranking = self._predict_label(out)
+            message.set(INTENT, label, add_to_output=True)
+            message.set("intent_ranking", label_ranking, add_to_output=True)
 
-                message.set(INTENT, label, add_to_output=True)
-                message.set("intent_ranking", label_ranking, add_to_output=True)
+        if self.component_config[ENTITY_RECOGNITION]:
+            entities = self._predict_entities(out, message)
 
-            if self.component_config[ENTITY_RECOGNITION]:
-                entities = self._predict_entities(out, message)
+            message.set(ENTITIES, entities, add_to_output=True)
 
-                message.set(ENTITIES, entities, add_to_output=True)
+        if out and DIAGNOSTIC_DATA in out:
+            message.add_diagnostic_data(self.unique_name, out.get(DIAGNOSTIC_DATA))
 
-            if out and self._execution_context.should_add_diagnostic_data:
-                message.add_diagnostic_data(self.unique_name, out.get(DIAGNOSTIC_DATA))
+    def persist(self, file_name: Text, model_dir: Text) -> Dict[Text, Any]:
+        """Persist this model into the passed directory.
 
-        return messages
-
-    def persist(self) -> None:
-        """Persist this model into the passed directory."""
+        Return the metadata necessary to load the model again.
+        """
         import shutil
 
         if self.model is None:
-            return None
+            return {"file": None}
 
-        with self._model_storage.write_to(self._resource) as model_path:
-            file_name = self.name
-            tf_model_file = model_path / f"{file_name}.tf_model"
+        model_dir_path = Path(model_dir)
+        tf_model_file = model_dir_path / f"{file_name}.tf_model"
 
-            rasa.shared.utils.io.create_directory_for_file(tf_model_file)
+        rasa.shared.utils.io.create_directory_for_file(tf_model_file)
 
-            if self.component_config[CHECKPOINT_MODEL]:
-                shutil.move(self.tmp_checkpoint_dir, model_path / "checkpoints")
-            self.model.save(str(tf_model_file))
+        if self.component_config[CHECKPOINT_MODEL]:
+            shutil.move(self.tmp_checkpoint_dir, model_dir_path / "checkpoints")
+        self.model.save(str(tf_model_file))
 
-            io_utils.pickle_dump(
-                model_path / f"{file_name}.data_example.pkl", self._data_example
-            )
-            io_utils.pickle_dump(
-                model_path / f"{file_name}.sparse_feature_sizes.pkl",
-                self._sparse_feature_sizes,
-            )
-            io_utils.pickle_dump(
-                model_path / f"{file_name}.label_data.pkl", dict(self._label_data.data)
-            )
-            io_utils.json_pickle(
-                model_path / f"{file_name}.index_label_id_mapping.json",
-                self.index_label_id_mapping,
-            )
+        io_utils.pickle_dump(
+            model_dir_path / f"{file_name}.data_example.pkl", self._data_example
+        )
+        io_utils.pickle_dump(
+            model_dir_path / f"{file_name}.sparse_feature_sizes.pkl",
+            self._sparse_feature_sizes,
+        )
+        io_utils.pickle_dump(
+            model_dir_path / f"{file_name}.label_data.pkl", dict(self._label_data.data)
+        )
+        io_utils.json_pickle(
+            model_dir_path / f"{file_name}.index_label_id_mapping.json",
+            self.index_label_id_mapping,
+        )
 
-            entity_tag_specs = (
-                [tag_spec._asdict() for tag_spec in self._entity_tag_specs]
-                if self._entity_tag_specs
-                else []
-            )
-            rasa.shared.utils.io.dump_obj_as_json_to_file(
-                model_path / f"{file_name}.entity_tag_specs.json", entity_tag_specs
-            )
+        entity_tag_specs = (
+            [tag_spec._asdict() for tag_spec in self._entity_tag_specs]
+            if self._entity_tag_specs
+            else []
+        )
+        rasa.shared.utils.io.dump_obj_as_json_to_file(
+            model_dir_path / f"{file_name}.entity_tag_specs.json", entity_tag_specs
+        )
 
-            return None
+        return {"file": file_name}
 
     @classmethod
     def load(
         cls,
-        config: Dict[Text, Any],
-        model_storage: ModelStorage,
-        resource: Resource,
-        execution_context: ExecutionContext,
+        meta: Dict[Text, Any],
+        model_dir: Text,
+        model_metadata: Metadata = None,
+        cached_component: Optional["DIETClassifier"] = None,
+        should_finetune: bool = False,
         **kwargs: Any,
-    ) -> "DIETClassifierGraphComponent":
+    ) -> "DIETClassifier":
         """Loads the trained model from the provided directory."""
-        with model_storage.read_from(resource) as model_path:
-            (
-                index_label_id_mapping,
-                entity_tag_specs,
-                label_data,
-                data_example,
-                sparse_feature_sizes,
-            ) = cls._load_from_files(model_path)
-
-            config = train_utils.update_confidence_type(config)
-            config = train_utils.update_similarity_type(config)
-            config = train_utils.update_deprecated_loss_type(config)
-
-            model = cls._load_model(
-                entity_tag_specs,
-                label_data,
-                config,
-                data_example,
-                model_path,
-                finetune_mode=execution_context.is_finetuning,
+        if not meta.get("file"):
+            logger.debug(
+                f"Failed to load model for '{cls.__name__}'. "
+                f"Maybe you did not provide enough training data and no model was "
+                f"trained or the path '{os.path.abspath(model_dir)}' doesn't exist?"
             )
+            return cls(component_config=meta)
 
-            return cls(
-                config=config,
-                model_storage=model_storage,
-                resource=resource,
-                execution_context=execution_context,
-                index_label_id_mapping=index_label_id_mapping,
-                entity_tag_specs=entity_tag_specs,
-                model=model,
-                sparse_feature_sizes=sparse_feature_sizes,
-            )
+        (
+            index_label_id_mapping,
+            entity_tag_specs,
+            label_data,
+            meta,
+            data_example,
+            sparse_feature_sizes,
+        ) = cls._load_from_files(meta, model_dir)
+
+        meta = train_utils.override_defaults(cls.defaults, meta)
+        meta = train_utils.update_confidence_type(meta)
+        meta = train_utils.update_similarity_type(meta)
+        meta = train_utils.update_deprecated_loss_type(meta)
+
+        model = cls._load_model(
+            entity_tag_specs,
+            label_data,
+            meta,
+            data_example,
+            model_dir,
+            finetune_mode=should_finetune,
+        )
+
+        return cls(
+            component_config=meta,
+            index_label_id_mapping=index_label_id_mapping,
+            entity_tag_specs=entity_tag_specs,
+            model=model,
+            finetune_mode=should_finetune,
+            sparse_feature_sizes=sparse_feature_sizes,
+        )
 
     @classmethod
     def _load_from_files(
-        cls, model_path: Path
+        cls, meta: Dict[Text, Any], model_dir: Text
     ) -> Tuple[
         Dict[int, Text],
         List[EntityTagSpec],
         RasaModelData,
+        Dict[Text, Any],
         Dict[Text, Dict[Text, List[FeatureArray]]],
         Dict[Text, Dict[Text, List[int]]],
     ]:
-        file_name = cls.name
+        file_name = meta["file"]
+
+        model_dir_path = Path(model_dir)
 
         data_example = io_utils.pickle_load(
-            model_path / f"{file_name}.data_example.pkl"
+            model_dir_path / f"{file_name}.data_example.pkl"
         )
         label_data = io_utils.pickle_load(
-            model_path / f"{file_name}.label_data.pkl"
+            model_dir_path / f"{file_name}.label_data.pkl"
         )
         label_data = RasaModelData(data=label_data)
         sparse_feature_sizes = io_utils.pickle_load(
-            model_path / f"{file_name}.sparse_feature_sizes.pkl"
+            model_dir_path / f"{file_name}.sparse_feature_sizes.pkl"
         )
         index_label_id_mapping = io_utils.json_unpickle(
-            model_path / f"{file_name}.index_label_id_mapping.json"
+            model_dir_path / f"{file_name}.index_label_id_mapping.json"
         )
         entity_tag_specs = rasa.shared.utils.io.read_json_file(
-            model_path / f"{file_name}.entity_tag_specs.json"
+            model_dir_path / f"{file_name}.entity_tag_specs.json"
         )
         entity_tag_specs = [
             EntityTagSpec(
@@ -1160,6 +1158,7 @@ class DIETClassifierGraphComponent(
             index_label_id_mapping,
             entity_tag_specs,
             label_data,
+            meta,
             data_example,
             sparse_feature_sizes,
         )
@@ -1169,16 +1168,16 @@ class DIETClassifierGraphComponent(
         cls,
         entity_tag_specs: List[EntityTagSpec],
         label_data: RasaModelData,
-        config: Dict[Text, Any],
+        meta: Dict[Text, Any],
         data_example: Dict[Text, Dict[Text, List[FeatureArray]]],
-        model_path: Path,
+        model_dir: Text,
         finetune_mode: bool = False,
     ) -> "RasaModel":
-        file_name = cls.name
-        tf_model_file = os.path.join(model_path, file_name + ".tf_model")
+        file_name = meta["file"]
+        tf_model_file = os.path.join(model_dir, file_name + ".tf_model")
 
-        label_key = LABEL_KEY if config[INTENT_CLASSIFICATION] else None
-        label_sub_key = LABEL_SUB_KEY if config[INTENT_CLASSIFICATION] else None
+        label_key = LABEL_KEY if meta[INTENT_CLASSIFICATION] else None
+        label_sub_key = LABEL_SUB_KEY if meta[INTENT_CLASSIFICATION] else None
 
         model_data_example = RasaModelData(
             label_key=label_key, label_sub_key=label_sub_key, data=data_example
@@ -1189,7 +1188,7 @@ class DIETClassifierGraphComponent(
             model_data_example,
             label_data,
             entity_tag_specs,
-            config,
+            meta,
             finetune_mode=finetune_mode,
         )
 
@@ -1202,7 +1201,7 @@ class DIETClassifierGraphComponent(
         model_data_example: RasaModelData,
         label_data: RasaModelData,
         entity_tag_specs: List[EntityTagSpec],
-        config: Dict[Text, Any],
+        meta: Dict[Text, Any],
         finetune_mode: bool,
     ) -> "RasaModel":
 
@@ -1222,7 +1221,7 @@ class DIETClassifierGraphComponent(
             data_signature=model_data_example.get_signature(),
             label_data=label_data,
             entity_tag_specs=entity_tag_specs,
-            config=copy.deepcopy(config),
+            config=copy.deepcopy(meta),
             finetune_mode=finetune_mode,
         )
 

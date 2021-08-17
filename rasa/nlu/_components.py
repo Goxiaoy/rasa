@@ -1,15 +1,14 @@
-from __future__ import annotations
-
-import abc
+# flake8: noqa
+# WARNING: This module will be dropped before Rasa Open Source 3.0 is released.
+#          Please don't do any changes in this module and rather adapt Component2 from
+#          the regular `rasa.nlu.components` module. This module is a workaround
+#          to defer breaking changes due to the architecture revamp in 3.0.
 from collections import defaultdict
 import itertools
 import logging
 import typing
-from typing import Any, Dict, List, Optional, Set, Text, Tuple, Type, Iterable
+from typing import Any, Dict, Hashable, List, Optional, Set, Text, Tuple, Type, Iterable
 
-from rasa.engine.graph import GraphComponent, ExecutionContext
-from rasa.engine.storage.resource import Resource
-from rasa.engine.storage.storage import ModelStorage
 import rasa.utils.train_utils
 from rasa.exceptions import MissingDependencyException
 from rasa.nlu.constants import COMPONENT_INDEX
@@ -21,18 +20,33 @@ from rasa.shared.exceptions import InvalidConfigException
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.nlu.training_data.message import Message
 import rasa.shared.utils.io
-import rasa.utils.common
 
-# All code outside this module will continue to use the old `Component` interface
-from rasa.nlu._components import Component
 
 if typing.TYPE_CHECKING:
     from rasa.nlu.model import Metadata
 
 logger = logging.getLogger(__name__)
 
-# This is a workaround around until we have all components migrated to `GraphComponent`.
-Component = Component
+
+def find_unavailable_packages(package_names: List[Text]) -> Set[Text]:
+    """Tries to import all package names and returns the packages where it failed.
+
+    Args:
+        package_names: The package names to import.
+
+    Returns:
+        Package names that could not be imported.
+    """
+
+    import importlib
+
+    failed_imports = set()
+    for package in package_names:
+        try:
+            importlib.import_module(package)
+        except ImportError:
+            failed_imports.add(package)
+    return failed_imports
 
 
 def validate_requirements(component_names: List[Optional[Text]]) -> None:
@@ -60,7 +74,7 @@ def validate_requirements(component_names: List[Optional[Text]]) -> None:
                 "the component."
             )
         component_class = registry.get_component_class(component_name)
-        unavailable_packages = rasa.utils.common.find_unavailable_packages(
+        unavailable_packages = find_unavailable_packages(
             component_class.required_packages()
         )
         if unavailable_packages:
@@ -87,7 +101,7 @@ def validate_requirements(component_names: List[Optional[Text]]) -> None:
 
 
 def validate_component_keys(
-    component: Component, component_config: Dict[Text, Any]
+    component: "Component", component_config: Dict[Text, Any]
 ) -> None:
     """Validates that all keys for a component are valid.
 
@@ -110,7 +124,7 @@ def validate_component_keys(
             )
 
 
-def validate_empty_pipeline(pipeline: List[Component]) -> None:
+def validate_empty_pipeline(pipeline: List["Component"]) -> None:
     """Ensures the pipeline is not empty.
 
     Args:
@@ -124,7 +138,7 @@ def validate_empty_pipeline(pipeline: List[Component]) -> None:
         )
 
 
-def validate_only_one_tokenizer_is_used(pipeline: List[Component]) -> None:
+def validate_only_one_tokenizer_is_used(pipeline: List["Component"]) -> None:
     """Validates that only one tokenizer is present in the pipeline.
 
     Args:
@@ -147,7 +161,7 @@ def validate_only_one_tokenizer_is_used(pipeline: List[Component]) -> None:
 
 
 def _required_component_in_pipeline(
-    required_component: Type[Component], pipeline: List[Component]
+    required_component: Type["Component"], pipeline: List["Component"]
 ) -> bool:
     """Checks that required component present in the pipeline.
 
@@ -165,7 +179,7 @@ def _required_component_in_pipeline(
     return False
 
 
-def validate_required_components(pipeline: List[Component]) -> None:
+def validate_required_components(pipeline: List["Component"]) -> None:
     """Validates that all required components are present in the pipeline.
 
     Args:
@@ -190,7 +204,7 @@ def validate_required_components(pipeline: List[Component]) -> None:
             )
 
 
-def validate_pipeline(pipeline: List[Component]) -> None:
+def validate_pipeline(pipeline: List["Component"]) -> None:
     """Validates the pipeline.
 
     Args:
@@ -203,7 +217,7 @@ def validate_pipeline(pipeline: List[Component]) -> None:
 
 
 def any_components_in_pipeline(
-    components: Iterable[Text], pipeline: List[Component]
+    components: Iterable[Text], pipeline: List["Component"]
 ) -> bool:
     """Check if any of the provided components are listed in the pipeline.
 
@@ -219,7 +233,7 @@ def any_components_in_pipeline(
 
 
 def find_components_in_pipeline(
-    components: Iterable[Text], pipeline: List[Component]
+    components: Iterable[Text], pipeline: List["Component"]
 ) -> Set[Text]:
     """Finds those of the given components that are present in the pipeline.
 
@@ -235,7 +249,7 @@ def find_components_in_pipeline(
 
 
 def validate_required_components_from_data(
-    pipeline: List[Component], data: TrainingData
+    pipeline: List["Component"], data: TrainingData
 ) -> None:
     """Validates that all components are present in the pipeline based on data.
 
@@ -334,7 +348,7 @@ def validate_required_components_from_data(
         )
 
 
-def warn_of_competing_extractors(pipeline: List[Component]) -> None:
+def warn_of_competing_extractors(pipeline: List["Component"]) -> None:
     """Warns the user when using competing extractors.
 
     Competing extractors are e.g. `CRFEntityExtractor` and `DIETClassifier`.
@@ -358,7 +372,7 @@ def warn_of_competing_extractors(pipeline: List[Component]) -> None:
 
 
 def warn_of_competition_with_regex_extractor(
-    pipeline: List[Component], data: TrainingData
+    pipeline: List["Component"], data: TrainingData
 ) -> None:
     """Warns when regex entity extractor is competing with a general one.
 
@@ -429,7 +443,7 @@ class UnsupportedLanguageError(RasaException):
         )
 
 
-class NLUGraphComponentMetaclass(abc.ABCMeta):
+class ComponentMetaclass(type):
     """Metaclass with `name` class property."""
 
     @property
@@ -438,7 +452,7 @@ class NLUGraphComponentMetaclass(abc.ABCMeta):
         return cls.__name__
 
 
-class NLUGraphComponent(GraphComponent, abc.ABC, metaclass=NLUGraphComponentMetaclass):
+class Component(metaclass=ComponentMetaclass):
     """A component is a message processing unit in a pipeline.
 
     Components are collected sequentially in a pipeline. Each component
@@ -483,26 +497,151 @@ class NLUGraphComponent(GraphComponent, abc.ABC, metaclass=NLUGraphComponentMeta
         index = self.component_config.get(COMPONENT_INDEX)
         return self.name if index is None else f"component_{index}_{self.name}"
 
-    def __init__(
-        self,
-        config: Dict[Text, Any],
-        model_storage: ModelStorage,
-        resource: Resource,
-        execution_context: ExecutionContext,
-    ) -> None:
+    @classmethod
+    def required_components(cls) -> List[Type["Component"]]:
+        """Specifies which components need to be present in the pipeline.
 
-        self.component_config: Dict[Text, Any] = config
+        Which components are required by this component.
+        Listed components should appear before the component itself in the pipeline.
+
+        Returns:
+            The class names of the required components.
+        """
+        return []
+
+    # Defines the default configuration parameters of a component
+    # these values can be overwritten in the pipeline configuration
+    # of the model. The component should choose sensible defaults
+    # and should be able to create reasonable results with the defaults.
+    defaults = {}
+
+    # Defines what language(s) this component can handle.
+    # This attribute is designed for instance method: `can_handle_language`.
+    # Default value is None. if both `support_language_list` and
+    # `not_supported_language_list` are None, it means it can handle
+    # all languages. Also, only one of `support_language_list` and
+    # `not_supported_language_list` can be set to not None.
+    # This is an important feature for backwards compatibility of components.
+    supported_language_list = None
+
+    # Defines what language(s) this component can NOT handle.
+    # This attribute is designed for instance method: `can_handle_language`.
+    # Default value is None. if both `support_language_list` and
+    # `not_supported_language_list` are None, it means it can handle
+    # all languages. Also, only one of `support_language_list` and
+    # `not_supported_language_list` can be set to not None.
+    # This is an important feature for backwards compatibility of components.
+    not_supported_language_list = None
+
+    def __init__(self, component_config: Optional[Dict[Text, Any]] = None) -> None:
+
+        if not component_config:
+            component_config = {}
+
+        # makes sure the name of the configuration is part of the config
+        # this is important for e.g. persistence
+        component_config["name"] = self.name
+
+        self.component_config: Dict[
+            Text, Any
+        ] = rasa.utils.train_utils.override_defaults(self.defaults, component_config)
 
         self.partial_processing_pipeline = None
         self.partial_processing_context = None
-        self._model_storage = model_storage
-        self._resource = resource
-        self._execution_context = execution_context
 
-    @abc.abstractmethod
+    @classmethod
+    def required_packages(cls) -> List[Text]:
+        """Specifies which python packages need to be installed.
+
+        E.g. ``["spacy"]``. More specifically, these should be
+        importable python package names e.g. `sklearn` and not package
+        names in the dependencies sense e.g. `scikit-learn`
+
+        This list of requirements allows us to fail early during training
+        if a required package is not installed.
+
+        Returns:
+            The list of required package names.
+        """
+        return []
+
+    @classmethod
+    def load(
+        cls,
+        meta: Dict[Text, Any],
+        model_dir: Text,
+        model_metadata: Optional["Metadata"] = None,
+        cached_component: Optional["Component"] = None,
+        **kwargs: Any,
+    ) -> "Component":
+        """Loads this component from file.
+
+        After a component has been trained, it will be persisted by
+        calling `persist`. When the pipeline gets loaded again,
+        this component needs to be able to restore itself.
+        Components can rely on any context attributes that are
+        created by :meth:`components.Component.create`
+        calls to components previous to this one.
+
+        Args:
+            meta: Any configuration parameter related to the model.
+            model_dir: The directory to load the component from.
+            model_metadata: The model's :class:`rasa.nlu.model.Metadata`.
+            cached_component: The cached component.
+
+        Returns:
+            the loaded component
+        """
+        if cached_component:
+            return cached_component
+
+        return cls(meta)
+
+    @classmethod
+    def create(
+        cls, component_config: Dict[Text, Any], config: RasaNLUModelConfig
+    ) -> "Component":
+        """Creates this component (e.g. before a training is started).
+
+        Method can access all configuration parameters.
+
+        Args:
+            component_config: The components configuration parameters.
+            config: The model configuration parameters.
+
+        Returns:
+            The created component.
+        """
+        # Check language supporting
+        language = config.language
+        if not cls.can_handle_language(language):
+            # check failed
+            raise UnsupportedLanguageError(cls.name, language)
+
+        return cls(component_config)
+
+    def provide_context(self) -> Optional[Dict[Text, Any]]:
+        """Initializes this component for a new pipeline.
+
+        This function will be called before the training
+        is started and before the first message is processed using
+        the interpreter. The component gets the opportunity to
+        add information to the context that is passed through
+        the pipeline during training and message parsing. Most
+        components do not need to implement this method.
+        It's mostly used to initialize framework environments
+        like MITIE and spacy
+        (e.g. loading word vectors for the pipeline).
+
+        Returns:
+            The updated component configuration.
+        """
+        pass
+
     def train(
         self,
         training_data: TrainingData,
+        config: Optional[RasaNLUModelConfig] = None,
         **kwargs: Any,
     ) -> None:
         """Trains this component.
@@ -521,16 +660,13 @@ class NLUGraphComponent(GraphComponent, abc.ABC, metaclass=NLUGraphComponentMeta
                 :class:`rasa.shared.nlu.training_data.training_data.TrainingData`.
             config: The model configuration parameters.
         """
-        ...
+        pass
 
-    # TODO: JUZL: .process_training_data()?
-
-    @abc.abstractmethod
-    def process(self, messages: List[Message], **kwargs: Any) -> List[Message]:
+    def process(self, message: Message, **kwargs: Any) -> None:
         """Processes an incoming message.
 
-        This is the components chance to process incoming
-        messages. The component can rely on
+        This is the components chance to process an incoming
+        message. The component can rely on
         any context attribute to be present, that gets created
         by a call to :meth:`rasa.nlu.components.Component.create`
         of ANY component and
@@ -539,29 +675,158 @@ class NLUGraphComponent(GraphComponent, abc.ABC, metaclass=NLUGraphComponentMeta
         of components previous to this one.
 
         Args:
-            messages: A list of  :class:`rasa.shared.nlu.training_data.message.Message`
-                to process.
+            message: The :class:`rasa.shared.nlu.training_data.message.Message` to
+                process.
         """
-        ...
+        pass
 
-    @abc.abstractmethod
-    def persist(self) -> None:
-        """Persists this component to disk for future loading."""
-        ...
+    def persist(self, file_name: Text, model_dir: Text) -> Optional[Dict[Text, Any]]:
+        """Persists this component to disk for future loading.
+
+        Args:
+            file_name: The file name of the model.
+            model_dir: The directory to store the model to.
+
+        Returns:
+            An optional dictionary with any information about the stored model.
+        """
+        pass
+
+    @classmethod
+    def cache_key(
+        cls, component_meta: Dict[Text, Any], model_metadata: "Metadata"
+    ) -> Optional[Text]:
+        """This key is used to cache components.
+
+        If a component is unique to a model it should return None.
+        Otherwise, an instantiation of the
+        component will be reused for all models where the
+        metadata creates the same key.
+
+        Args:
+            component_meta: The component configuration.
+            model_metadata: The component's :class:`rasa.nlu.model.Metadata`.
+
+        Returns:
+            A unique caching key.
+        """
+        return None
+
+    def __getstate__(self) -> Any:
+        """Gets a copy of picklable parts of the component."""
+        d = self.__dict__.copy()
+        # these properties should not be pickled
+        if "partial_processing_context" in d:
+            del d["partial_processing_context"]
+        if "partial_processing_pipeline" in d:
+            del d["partial_processing_pipeline"]
+        return d
 
     def __eq__(self, other: Any) -> bool:
         return self.__dict__ == other.__dict__
 
+    def prepare_partial_processing(
+        self, pipeline: List["Component"], context: Dict[Text, Any]
+    ) -> None:
+        """Sets the pipeline and context used for partial processing.
+
+        The pipeline should be a list of components that are
+        previous to this one in the pipeline and
+        have already finished their training (and can therefore
+        be safely used to process messages).
+
+        Args:
+            pipeline: The list of components.
+            context: The context of processing.
+
+        """
+
+        self.partial_processing_pipeline = pipeline
+        self.partial_processing_context = context
+
+    def partially_process(self, message: Message) -> Message:
+        """Allows the component to process messages during
+        training (e.g. external training data).
+
+        The passed message will be processed by all components
+        previous to this one in the pipeline.
+
+        Args:
+            message: The :class:`rasa.shared.nlu.training_data.message.Message` to
+            process.
+
+        Returns:
+            The processed :class:`rasa.shared.nlu.training_data.message.Message`.
+
+        """
+
+        if self.partial_processing_context is not None:
+            for component in self.partial_processing_pipeline:
+                component.process(message, **self.partial_processing_context)
+        else:
+            logger.info("Failed to run partial processing due to missing pipeline.")
+        return message
+
     @classmethod
-    def create(
-        cls,
-        config: Dict[Text, Any],
-        model_storage: ModelStorage,
-        resource: Resource,
-        execution_context: ExecutionContext,
-    ) -> NLUGraphComponent:
-        """Creates a new untrained component (see parent class for full docstring)."""
-        return cls(config, model_storage, resource, execution_context)
+    def can_handle_language(cls, language: Hashable) -> bool:
+        """Check if component supports a specific language.
+
+        This method can be overwritten when needed. (e.g. dynamically
+        determine which language is supported.)
+
+        Args:
+            language: The language to check.
+
+        Returns:
+            `True` if component can handle specific language, `False` otherwise.
+        """
+
+        # If both `supported_language_list` and `not_supported_language_list` are set
+        # to `None`,
+        # it means: support all languages
+        if language is None or (
+            cls.supported_language_list is None
+            and cls.not_supported_language_list is None
+        ):
+            return True
+
+        # check language supporting settings
+        if cls.supported_language_list and cls.not_supported_language_list:
+            # When user set both language supporting settings to not None, it will lead
+            # to ambiguity.
+            raise RasaException(
+                "Only one of `supported_language_list` and"
+                "`not_supported_language_list` can be set to not None"
+            )
+
+        # convert to `list` for membership test
+        supported_language_list = (
+            cls.supported_language_list
+            if cls.supported_language_list is not None
+            else []
+        )
+        not_supported_language_list = (
+            cls.not_supported_language_list
+            if cls.not_supported_language_list is not None
+            else []
+        )
+
+        # check if user provided a valid setting
+        if not supported_language_list and not not_supported_language_list:
+            # One of language settings must be valid (not None and not a empty list),
+            # There are three combinations of settings are not valid:
+            # (None, []), ([], None) and ([], [])
+            raise RasaException(
+                "Empty lists for both "
+                "`supported_language_list` and `not_supported language_list` "
+                "is not a valid setting. If you meant to allow all languages "
+                "for the component use `None` for both of them."
+            )
+
+        if supported_language_list:
+            return language in supported_language_list
+        else:
+            return language not in not_supported_language_list
 
 
 class ComponentBuilder:

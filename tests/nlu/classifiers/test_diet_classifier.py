@@ -1,13 +1,23 @@
+import copy
 from pathlib import Path
 
+from _pytest.tmpdir import TempPathFactory
 import numpy as np
 import pytest
 from unittest.mock import Mock
-from typing import List, Text, Dict, Any
+from typing import Callable, List, Text, Dict, Any, Union
 from _pytest.monkeypatch import MonkeyPatch
 
+from rasa.engine.graph import ExecutionContext
+from rasa.engine.storage.resource import Resource
+from rasa.engine.storage.storage import ModelStorage
 import rasa.model
+from rasa.nlu import registry
+from rasa.nlu.featurizers.sparse_featurizer.count_vectors_featurizer import (
+    CountVectorsFeaturizer,
+)
 from rasa.shared.exceptions import InvalidConfigException
+from rasa.shared.importers.rasa import RasaFileImporter
 from rasa.shared.nlu.training_data.features import Features
 import rasa.nlu.train
 from rasa.nlu.classifiers import LABEL_RANKING_LENGTH
@@ -39,7 +49,7 @@ from rasa.utils.tensorflow.constants import (
 )
 from rasa.nlu.components import ComponentBuilder
 from rasa.nlu.tokenizers.whitespace_tokenizer import WhitespaceTokenizer
-from rasa.nlu.classifiers.diet_classifier import DIETClassifier
+from rasa.nlu.classifiers.diet_classifier import DIETClassifierGraphComponent
 from rasa.nlu.model import Interpreter
 from rasa.shared.nlu.training_data.message import Message
 from rasa.shared.nlu.training_data.training_data import TrainingData
@@ -47,6 +57,23 @@ from rasa.utils import train_utils
 from rasa.shared.constants import DIAGNOSTIC_DATA
 from rasa.shared.nlu.training_data.loading import load_data
 from rasa.utils.tensorflow.model_data_utils import FeatureArray
+
+ConfigToClassifier = Callable[[Dict[Text, Any]], DIETClassifierGraphComponent]
+
+
+@pytest.fixture()
+def create_classifier(
+    default_model_storage: ModelStorage, default_execution_context: ExecutionContext
+) -> ConfigToClassifier:
+    def inner(config: Dict[Text, Any]) -> DIETClassifierGraphComponent:
+        return DIETClassifierGraphComponent(
+            config={**DIETClassifierGraphComponent.default_config, **config},
+            model_storage=default_model_storage,
+            execution_context=default_execution_context,
+            resource=Resource("DIET"),
+        )
+
+    return inner
 
 
 def test_compute_default_label_features():
@@ -57,7 +84,9 @@ def test_compute_default_label_features():
         Message(data={TEXT: "test d"}),
     ]
 
-    output = DIETClassifier._compute_default_label_features(label_features)
+    output = DIETClassifierGraphComponent._compute_default_label_features(
+        label_features
+    )
 
     output = output[0]
 
@@ -128,9 +157,11 @@ def get_checkpoint_dir_path(path: Path, model_dir: Path) -> Path:
         ),
     ],
 )
-def test_check_labels_features_exist(messages, expected):
+def test_check_labels_features_exist(
+    messages: List[Message], expected: bool, create_classifier: ConfigToClassifier
+):
     attribute = TEXT
-    classifier = DIETClassifier()
+    classifier = create_classifier({})
     assert classifier._check_labels_features_exist(messages, attribute) == expected
 
 
@@ -170,9 +201,11 @@ def test_check_labels_features_exist(messages, expected):
     ],
 )
 def test_model_data_signature_with_entities(
-    messages: List[Message], entity_expected: bool
+    messages: List[Message],
+    entity_expected: bool,
+    create_classifier: ConfigToClassifier,
 ):
-    classifier = DIETClassifier({"BILOU_flag": False})
+    classifier = create_classifier({"BILOU_flag": False})
     training_data = TrainingData(messages)
 
     # create tokens for entity parsing inside DIET
@@ -184,39 +217,65 @@ def test_model_data_signature_with_entities(
     assert entity_exists == entity_expected
 
 
-async def _train_persist_load_with_different_settings(
+# TODO: JUZL: clean this up
+def train_then_process_classifier(
+    classifier: DIETClassifierGraphComponent,
     pipeline: List[Dict[Text, Any]],
-    component_builder: ComponentBuilder,
-    tmp_path: Path,
-    should_finetune: bool,
+    training_data: Union[
+        str, TrainingData
+    ] = "data/examples/rasa/demo-rasa-multi-intent.yml",
+    message_text: Text = "Rasa is great!",
+    should_finetune=False,
+    expect_intent=True,
 ):
-    _config = RasaNLUModelConfig({"pipeline": pipeline, "language": "en"})
 
-    (trainer, trained, persisted_path) = await rasa.nlu.train.train(
-        _config,
-        path=str(tmp_path),
-        data="data/examples/rasa/demo-rasa-multi-intent.yml",
-        component_builder=component_builder,
+    loaded_pipeline = [
+        registry.get_component_class(component.pop("name"))(component)
+        for component in pipeline
+    ]
+
+    if isinstance(training_data, str):
+        importer = RasaFileImporter(training_data_paths=[training_data])
+        training_data = importer.get_nlu_data()
+
+    for component in loaded_pipeline:
+        component.train(training_data)
+
+    classifier.train(training_data=training_data)
+
+    message = Message(data={TEXT: message_text})
+    for component in loaded_pipeline:
+        component.process(message)
+
+    message2 = copy.deepcopy(message)
+
+    classified_message = classifier.process([message])[0]
+
+    if expect_intent:
+        assert classified_message.data["intent"]["name"]
+
+    execution_context = classifier._execution_context
+    execution_context.is_finetuning = should_finetune
+    loaded_classifier = classifier.__class__.load(
+        config=classifier.component_config,
+        model_storage=classifier._model_storage,
+        resource=classifier._resource,
+        execution_context=execution_context,
     )
 
-    assert trainer.pipeline
-    assert trained.pipeline
+    classified_message2 = loaded_classifier.process([message2])[0]
 
-    loaded = Interpreter.load(
-        persisted_path,
-        component_builder,
-        new_config=_config if should_finetune else None,
-    )
-
-    assert loaded.pipeline
-    assert loaded.parse("Rasa is great!") == trained.parse("Rasa is great!")
+    assert classified_message2.as_dict() == classified_message.as_dict()
+    return classified_message
 
 
 @pytest.mark.skip_on_windows
 @pytest.mark.timeout(120, func_only=True)
+@pytest.mark.parametrize("should_finetune", [True, False])
 async def test_train_persist_load_with_different_settings_non_windows(
-    component_builder: ComponentBuilder, tmp_path: Path
+    create_classifier: ConfigToClassifier, should_finetune: bool
 ):
+    classifier = create_classifier({MASKED_LM: True, EPOCHS: 1})
     pipeline = [
         {
             "name": "WhitespaceTokenizer",
@@ -224,97 +283,53 @@ async def test_train_persist_load_with_different_settings_non_windows(
             "intent_split_symbol": "+",
         },
         {"name": "CountVectorsFeaturizer"},
-        {"name": "DIETClassifier", MASKED_LM: True, EPOCHS: 1},
     ]
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmp_path, should_finetune=False
-    )
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmp_path, should_finetune=True
-    )
+    train_then_process_classifier(classifier, pipeline, should_finetune=should_finetune)
 
 
 @pytest.mark.timeout(120, func_only=True)
-async def test_train_persist_load_with_different_settings(component_builder, tmpdir):
+@pytest.mark.parametrize("should_finetune", [True, False])
+async def test_train_persist_load_with_different_settings(
+    create_classifier: ConfigToClassifier, should_finetune: bool,
+):
+    classifier = create_classifier({LOSS_TYPE: "margin", EPOCHS: 1})
     pipeline = [
         {"name": "WhitespaceTokenizer"},
         {"name": "CountVectorsFeaturizer"},
-        {"name": "DIETClassifier", LOSS_TYPE: "margin", EPOCHS: 1},
     ]
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmpdir, should_finetune=False
-    )
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmpdir, should_finetune=True
-    )
+    train_then_process_classifier(classifier, pipeline, should_finetune=should_finetune)
 
 
 @pytest.mark.timeout(120, func_only=True)
+@pytest.mark.parametrize("should_finetune", [True, False])
 async def test_train_persist_load_with_only_entity_recognition(
-    component_builder, tmpdir
+    create_classifier: ConfigToClassifier, should_finetune: bool,
 ):
+    classifier = create_classifier(
+        {ENTITY_RECOGNITION: True, INTENT_CLASSIFICATION: False, EPOCHS: 1}
+    )
     pipeline = [
         {"name": "WhitespaceTokenizer"},
         {"name": "CountVectorsFeaturizer"},
-        {
-            "name": "DIETClassifier",
-            ENTITY_RECOGNITION: True,
-            INTENT_CLASSIFICATION: False,
-            EPOCHS: 1,
-        },
     ]
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmpdir, should_finetune=False
-    )
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmpdir, should_finetune=True
+    train_then_process_classifier(
+        classifier, pipeline, should_finetune=should_finetune, expect_intent=False
     )
 
 
 @pytest.mark.timeout(120, func_only=True)
+@pytest.mark.parametrize("should_finetune", [True, False])
 async def test_train_persist_load_with_only_intent_classification(
-    component_builder, tmpdir
+    create_classifier: ConfigToClassifier, should_finetune: bool,
 ):
+    classifier = create_classifier(
+        {ENTITY_RECOGNITION: False, INTENT_CLASSIFICATION: True, EPOCHS: 1,}
+    )
     pipeline = [
         {"name": "WhitespaceTokenizer"},
         {"name": "CountVectorsFeaturizer"},
-        {
-            "name": "DIETClassifier",
-            ENTITY_RECOGNITION: False,
-            INTENT_CLASSIFICATION: True,
-            EPOCHS: 1,
-        },
     ]
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmpdir, should_finetune=False
-    )
-    await _train_persist_load_with_different_settings(
-        pipeline, component_builder, tmpdir, should_finetune=True
-    )
-
-
-async def test_raise_error_on_incorrect_pipeline(
-    component_builder, tmp_path: Path, nlu_as_json_path: Text
-):
-    _config = RasaNLUModelConfig(
-        {
-            "pipeline": [
-                {"name": "WhitespaceTokenizer"},
-                {"name": "DIETClassifier", EPOCHS: 1},
-            ],
-            "language": "en",
-        }
-    )
-
-    with pytest.raises(Exception) as e:
-        await rasa.nlu.train.train(
-            _config,
-            path=str(tmp_path),
-            data=nlu_as_json_path,
-            component_builder=component_builder,
-        )
-
-    assert "'DIETClassifier' requires 'Featurizer'" in str(e.value)
+    train_then_process_classifier(classifier, pipeline, should_finetune=should_finetune)
 
 
 def as_pipeline(*components):
@@ -357,29 +372,19 @@ def as_pipeline(*components):
     ],
 )
 async def test_softmax_normalization(
-    component_builder,
-    tmp_path,
     classifier_params,
     data_path: Text,
     output_length,
     output_should_sum_to_1,
+    create_classifier: ConfigToClassifier,
 ):
-    pipeline = as_pipeline(
-        "WhitespaceTokenizer", "CountVectorsFeaturizer", "DIETClassifier"
-    )
-    assert pipeline[2]["name"] == "DIETClassifier"
-    pipeline[2].update(classifier_params)
+    pipeline = as_pipeline("WhitespaceTokenizer", "CountVectorsFeaturizer")
+    classifier = create_classifier(classifier_params)
 
-    _config = RasaNLUModelConfig({"pipeline": pipeline})
-    (trained_model, _, persisted_path) = await rasa.nlu.train.train(
-        _config,
-        path=str(tmp_path),
-        data=data_path,
-        component_builder=component_builder,
+    parsed_message = train_then_process_classifier(
+        classifier, pipeline, message_text="hello"
     )
-    loaded = Interpreter.load(persisted_path, component_builder)
-
-    parse_data = loaded.parse("hello")
+    parse_data = parsed_message.data
     intent_ranking = parse_data.get("intent_ranking")
     # check that the output was correctly truncated after normalization
     assert len(intent_ranking) == output_length
@@ -815,7 +820,7 @@ def test_removing_label_sparse_feature_sizes(
     label_attribute: Text,
 ):
     """Tests if label attribute is removed from sparse feature sizes collection."""
-    sparse_feature_sizes = DIETClassifier._remove_label_sparse_feature_sizes(
+    sparse_feature_sizes = DIETClassifierGraphComponent._remove_label_sparse_feature_sizes(
         sparse_feature_sizes=initial_sparse_feature_sizes,
         label_attribute=label_attribute,
     )
@@ -1038,3 +1043,26 @@ async def test_sparse_feature_sizes_decreased_incremental_training(
             model_to_finetune=loaded,
         )
         assert trained.pipeline
+
+
+def test_diet_joe(
+    default_model_storage: ModelStorage, default_execution_context: ExecutionContext,
+):
+    test_data = "data/test/many_intents.yml"
+    config = {EPOCHS: 1}
+    full_config = {**DIETClassifierGraphComponent.default_config, **config}
+    resource = Resource("DIET")
+    classifier = DIETClassifierGraphComponent(
+        config=full_config,
+        model_storage=default_model_storage,
+        execution_context=default_execution_context,
+        resource=resource,
+    )
+
+    message = Message(data={TEXT: "hello"})
+    parsed_message = train_then_process_classifier(classifier, test_data, message)
+
+    assert parsed_message.data["intent"]["name"]
+
+
+# TODO: JUZL: test using a graph node?
